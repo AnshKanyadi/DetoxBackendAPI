@@ -19,11 +19,11 @@ import time
 import hashlib
 from typing import Optional
 from contextlib import contextmanager
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from paddleocr import PaddleOCR
+import easyocr
 from PIL import Image
 import numpy as np
 
@@ -56,12 +56,6 @@ app = FastAPI(
 )
 
 # CORS - configure for production
-ALLOWED_ORIGINS = [
-    "chrome-extension://*",  # Chrome extensions
-    "http://localhost:*",    # Local development
-    "https://detox.app",     # Your production domain (update this)
-]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # In production, restrict this
@@ -127,7 +121,6 @@ def secure_image_context(image_data: bytes):
     Context manager for secure image processing.
     Ensures image data is cleared from memory after use.
     """
-    img_array = None
     image = None
     try:
         image = Image.open(io.BytesIO(image_data))
@@ -139,23 +132,23 @@ def secure_image_context(image_data: bytes):
         if image:
             image.close()
         del image
-        del img_array
         gc.collect()  # Force garbage collection
 
 # =============================================================================
 # OCR Engine (Lazy Loaded)
 # =============================================================================
 
-ocr_engine: Optional[PaddleOCR] = None
+ocr_reader: Optional[easyocr.Reader] = None
 
 def get_ocr():
-    """Lazy initialize PaddleOCR engine"""
-    global ocr_engine
-    if ocr_engine is None:
-        logger.info("Initializing PaddleOCR engine...")
-        ocr_engine = PaddleOCR(lang='en', device='cpu')
-        logger.info("PaddleOCR ready")
-    return ocr_engine
+    """Lazy initialize EasyOCR reader"""
+    global ocr_reader
+    if ocr_reader is None:
+        logger.info("Initializing EasyOCR engine...")
+        # Initialize with English language, GPU disabled for compatibility
+        ocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+        logger.info("EasyOCR ready")
+    return ocr_reader
 
 # =============================================================================
 # Pattern Detection
@@ -340,14 +333,15 @@ async def analyze_image(request: AnalyzeRequest):
             
             img_array = np.array(image)
             
-            # Run OCR
+            # Run OCR with EasyOCR
             logger.info(f"[{processing_id}] Running OCR...")
-            ocr = get_ocr()
-            try:
-                result = ocr.ocr(img_array)
-            except Exception as ocr_err:
-                logger.error(f"[{processing_id}] OCR method error: {ocr_err}, trying predict...")
-                result = ocr.predict(img_array)
+            reader = get_ocr()
+            
+            # EasyOCR returns list of (bbox, text, confidence)
+            # bbox is [[x1,y1], [x2,y1], [x2,y2], [x1,y2]]
+            results = reader.readtext(img_array)
+            
+            logger.info(f"[{processing_id}] OCR found {len(results)} text regions")
             
             # Clear image array immediately
             del img_array
@@ -361,115 +355,62 @@ async def analyze_image(request: AnalyzeRequest):
         detections = []
         all_text_parts = []
         
-        logger.info(f"[{processing_id}] Processing OCR result type: {type(result)}")
+        for bbox, text, confidence in results:
+            if not text or not text.strip():
+                continue
+            
+            all_text_parts.append(text)
+            
+            # EasyOCR bbox format: [[x1,y1], [x2,y1], [x2,y2], [x1,y2]]
+            # Convert to x, y, width, height
+            xs = [p[0] for p in bbox]
+            ys = [p[1] for p in bbox]
+            x = min(xs)
+            y = min(ys)
+            width = max(xs) - min(xs)
+            height = max(ys) - min(ys)
+            
+            # Check for sensitive patterns
+            findings = detect_sensitive(text)
+            for finding in findings:
+                detections.append(Detection(
+                    text=finding["text"],
+                    type=finding["type"],
+                    confidence=float(confidence),
+                    bbox=BoundingBox(x=float(x), y=float(y), width=float(width), height=float(height))
+                ))
         
-        if result and len(result) > 0:
-            for item in result:
-                # Handle new API format (dict with rec_texts)
-                if isinstance(item, dict):
-                    texts = item.get('rec_texts', [])
-                    scores = item.get('rec_scores', [])
-                    polys = item.get('dt_polys', [])
-                    
-                    for i, text in enumerate(texts):
-                        if not text or not text.strip():
-                            continue
-                        all_text_parts.append(text)
-                        confidence = scores[i] if i < len(scores) else 0.9
-                        
-                        if i < len(polys):
-                            poly = polys[i]
-                            if len(poly) >= 4:
-                                xs = [p[0] for p in poly]
-                                ys = [p[1] for p in poly]
-                                bbox = BoundingBox(
-                                    x=float(min(xs)),
-                                    y=float(min(ys)),
-                                    width=float(max(xs) - min(xs)),
-                                    height=float(max(ys) - min(ys))
-                                )
-                                
-                                findings = detect_sensitive(text)
-                                for finding in findings:
-                                    detections.append(Detection(
-                                        text=finding["text"],
-                                        type=finding["type"],
-                                        confidence=float(confidence),
-                                        bbox=bbox
-                                    ))
-                
-                # Handle old API format (list of [polygon, (text, score)])
-                elif isinstance(item, list):
-                    for line in item:
-                        if not line or len(line) < 2:
-                            continue
-                        polygon = line[0]
-                        text_data = line[1]
-                        
-                        if isinstance(text_data, tuple) and len(text_data) >= 2:
-                            text = text_data[0]
-                            confidence = text_data[1]
-                        else:
-                            continue
-                        
-                        if not text or not text.strip():
-                            continue
-                        
-                        all_text_parts.append(text)
-                        
-                        if polygon and len(polygon) >= 4:
-                            xs = [p[0] for p in polygon]
-                            ys = [p[1] for p in polygon]
-                            bbox = BoundingBox(
+        # Also check concatenated text for multi-word patterns
+        full_text = " ".join(all_text_parts)
+        full_findings = detect_sensitive(full_text)
+        existing_texts = {d.text.lower() for d in detections}
+        
+        # For multi-word findings not already captured, try to find their bbox
+        for finding in full_findings:
+            if finding["text"].lower() not in existing_texts:
+                # Find which OCR result contains this text
+                for bbox, text, confidence in results:
+                    if finding["text"].lower() in text.lower():
+                        xs = [p[0] for p in bbox]
+                        ys = [p[1] for p in bbox]
+                        detections.append(Detection(
+                            text=finding["text"],
+                            type=finding["type"],
+                            confidence=float(confidence),
+                            bbox=BoundingBox(
                                 x=float(min(xs)),
                                 y=float(min(ys)),
                                 width=float(max(xs) - min(xs)),
                                 height=float(max(ys) - min(ys))
                             )
-                            
-                            findings = detect_sensitive(text)
-                            for finding in findings:
-                                detections.append(Detection(
-                                    text=finding["text"],
-                                    type=finding["type"],
-                                    confidence=float(confidence),
-                                    bbox=bbox
-                                ))
-        
-        full_text = " ".join(all_text_parts)
-        
-        # Check full text for multi-word patterns
-        full_findings = detect_sensitive(full_text)
-        existing = {d.text.lower() for d in detections}
-        
-        for finding in full_findings:
-            if finding["text"].lower() not in existing and result:
-                for item in result:
-                    if isinstance(item, dict):
-                        texts = item.get('rec_texts', [])
-                        polys = item.get('dt_polys', [])
-                        scores = item.get('rec_scores', [])
-                        
-                        for i, text in enumerate(texts):
-                            if finding["text"].lower() in text.lower() and i < len(polys):
-                                poly = polys[i]
-                                if len(poly) >= 4:
-                                    xs = [p[0] for p in poly]
-                                    ys = [p[1] for p in poly]
-                                    detections.append(Detection(
-                                        text=finding["text"],
-                                        type=finding["type"],
-                                        confidence=float(scores[i]) if i < len(scores) else 0.9,
-                                        bbox=BoundingBox(
-                                            x=float(min(xs)),
-                                            y=float(min(ys)),
-                                            width=float(max(xs) - min(xs)),
-                                            height=float(max(ys) - min(ys))
-                                        )
-                                    ))
-                                break
+                        ))
+                        break
         
         logger.info(f"[{processing_id}] Found {len(detections)} sensitive items")
+        
+        # Log detected items (text only, no coordinates for privacy)
+        for det in detections:
+            logger.info(f"[{processing_id}]   -> {det.type}: {det.text[:20]}...")
         
         return AnalyzeResponse(
             success=True,
@@ -483,7 +424,7 @@ async def analyze_image(request: AnalyzeRequest):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"[{processing_id}] Error: {type(e).__name__}")  # Don't log details
+        logger.error(f"[{processing_id}] Error: {type(e).__name__}: {str(e)}")
         raise HTTPException(status_code=500, detail="Processing failed")
 
 # =============================================================================
@@ -497,6 +438,7 @@ async def startup_event():
     logger.info("DETOX API - Privacy-Focused OCR Service")
     logger.info("=" * 50)
     logger.info("Security: Images are NEVER stored or logged")
+    logger.info("Using EasyOCR for text detection")
     logger.info("Server ready! (OCR loads on first request)")
     logger.info("=" * 50)
 
