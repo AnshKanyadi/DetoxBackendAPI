@@ -9,7 +9,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     CUDA_VISIBLE_DEVICES="" \
-    EASYOCR_MODULE_PATH=/home/detox/.EasyOCR
+    EASYOCR_MODULE_PATH=/app/.EasyOCR
 
 WORKDIR /app
 
@@ -32,20 +32,22 @@ RUN pip install --no-cache-dir "numpy<2.0.0" && \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Pre-download EasyOCR models at build time (saves ~30s on first request)
+RUN python -c "import easyocr; easyocr.Reader(['en'], gpu=False, verbose=True)"
+
 # Copy application code
 COPY main.py .
 
 # Create non-root user
 RUN useradd --create-home --shell /bin/bash detox \
-    && mkdir -p /home/detox/.EasyOCR \
-    && chown -R detox:detox /home/detox
+    && chown -R detox:detox /app
 
 USER detox
 
 EXPOSE 8000
 
-# Health check with longer start period for model loading
-HEALTHCHECK --interval=30s --timeout=30s --start-period=180s --retries=5 \
+# Health check
+HEALTHCHECK --interval=30s --timeout=30s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}

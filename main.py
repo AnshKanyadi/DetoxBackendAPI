@@ -322,8 +322,8 @@ async def analyze_image(request: AnalyzeRequest):
             original_size = image.size
             scale_factor = 1.0
             
-            # Resize for faster processing
-            max_dim = 1500
+            # Resize for faster processing (smaller = much faster OCR)
+            max_dim = 800
             if image.width > max_dim or image.height > max_dim:
                 ratio = min(max_dim / image.width, max_dim / image.height)
                 new_size = (int(image.width * ratio), int(image.height * ratio))
